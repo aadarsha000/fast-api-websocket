@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Up vs Down Game</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; background: #f4f4f4; color: #111; }
+    h1, h2 { margin-top: 20px; }
+    .highlight { font-size: 22px; font-weight: bold; color: #222; }
+    canvas { background: #111; border-radius: 8px; margin-top: 20px; width: 100%; max-width: 1000px; }
+    .debug { background: #fff; padding: 10px; margin: 10px 0; border-radius: 5px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
+    .status { padding: 5px 10px; margin: 5px 0; border-radius: 3px; display: inline-block; }
+    .connected { background: #d4edda; color: #155724; }
+    .disconnected { background: #f8d7da; color: #721c24; }
+    .error { background: #fff3cd; color: #856404; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <h1>🟢 Up vs Down Game (Live)</h1>
+
+  <!-- Connection Status -->
+  <div id="ws1-status" class="status disconnected">WS1: Disconnected</div>
+  <div id="ws2-status" class="status disconnected">WS2: Disconnected</div>
+
+  <h2>⏱ Game Timer</h2>
+  <div id="timer" class="highlight">Loading...</div>
+
+  <h2>✅ Live BTC Price</h2>
+  <div id="live-price" class="highlight">-</div>
+
+  <h2>🚀 Start Price</h2>
+  <div id="start-price" class="highlight">-</div>
+
+  <h2>📉 End Price</h2>
+  <div id="end-price" class="highlight">-</div>
+
+  <h2>🏁 Result</h2>
+  <div id="result" class="highlight">-</div>
+
+  <canvas id="priceChart" height="300"></canvas>
+
+  <h2>🔍 Debug Info</h2>
+  <div id="debug" class="debug">Initializing...</div>
+
+  <script>
+    const timerDiv = document.getElementById("timer");
+    const livePriceDiv = document.getElementById("live-price");
+    const startPriceDiv = document.getElementById("start-price");
+    const endPriceDiv = document.getElementById("end-price");
+    const resultDiv = document.getElementById("result");
+    const ws1Status = document.getElementById("ws1-status");
+    const ws2Status = document.getElementById("ws2-status");
+
+    let cycleStart = Date.now() - (Date.now() % 60000);
+    let startPrice = null;
+    let lastPriceUpdate = 0;
+    let ws1, ws2;
+
+    const debugDiv = document.getElementById("debug");
+    function debugLog(message) {
+      const timestamp = new Date().toLocaleTimeString();
+      debugDiv.innerHTML += `[${timestamp}] ${message}<br>`;
+      debugDiv.scrollTop = debugDiv.scrollHeight;
+      console.log(`[${timestamp}] ${message}`);
+    }
+
+    // Setup Chart
+    const ctx = document.getElementById('priceChart').getContext('2d');
+    const chartLabels = [];
+    const priceChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: chartLabels,
+        datasets: [
+          {
+            label: 'BTC Price',
+            data: [],
+            borderColor: '#FFD700',
+            backgroundColor: 'rgba(255, 215, 0, 0.1)',
+            borderWidth: 2,
+            pointRadius: 1,
+            tension: 0.3,
+            fill: false
+          },
+          {
+            label: 'Start Price',
+            data: [],
+            borderColor: '#00FF00',
+            borderWidth: 1,
+            borderDash: [5, 5],
+            pointRadius: 0,
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: false,
+        animation: false,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            ticks: {
+              color: '#ccc',
+              maxTicksLimit: 10,
+              callback: function(value, index) {
+                return chartLabels[index] || '';
+              }
+            },
+            grid: {
+              color: 'rgba(255, 255, 255, 0.1)'
+            }
+          },
+          y: {
+            ticks: {
+              color: '#ccc',
+              callback: function(value) {
+                return `$${value.toLocaleString()}`;
+              }
+            },
+            grid: {
+              color: 'rgba(255, 255, 255, 0.1)'
+            }
+          }
+        },
+        plugins: {
+          legend: {
+            labels: {
+              color: '#ccc'
+            }
+          }
+        }
+      }
+    });
+
+    function connectWebSocket1() {
+      try {
+        ws1 = new WebSocket("ws://localhost:8000/ws1");
+
+        ws1.onopen = () => {
+          ws1Status.textContent = "WS1: Connected";
+          ws1Status.className = "status connected";
+          debugLog("WS1 connected");
+        };
+
+        ws1.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          debugLog(`WS1 received: ${JSON.stringify(data)}`);
+          if (data.price && data.timestamp) {
+            const price = parseFloat(data.price);
+            const label = new Date(data.timestamp).toLocaleTimeString();
+            livePriceDiv.textContent = `$${price.toLocaleString()}`;
+
+            chartLabels.push(label);
+            priceChart.data.labels = chartLabels;
+            priceChart.data.datasets[0].data.push(price);
+
+            if (chartLabels.length > 50) {
+              chartLabels.shift();
+              priceChart.data.datasets[0].data.shift();
+              if (priceChart.data.datasets[1].data.length > 0) {
+                priceChart.data.datasets[1].data.shift();
+              }
+            }
+
+            priceChart.update('none');
+            lastPriceUpdate = Date.now();
+          }
+        };
+
+        ws1.onclose = () => {
+          ws1Status.textContent = "WS1: Disconnected";
+          ws1Status.className = "status disconnected";
+          debugLog("WS1 disconnected. Reconnecting...");
+          setTimeout(connectWebSocket1, 3000);
+        };
+
+        ws1.onerror = (error) => {
+          ws1Status.textContent = "WS1: Error";
+          ws1Status.className = "status error";
+          debugLog(`WS1 error: ${error}`);
+        };
+      } catch (err) {
+        debugLog(`WS1 connection error: ${err.message}`);
+      }
+    }
+
+    function connectWebSocket2() {
+      try {
+        ws2 = new WebSocket("ws://localhost:8000/ws2");
+
+        ws2.onopen = () => {
+          ws2Status.textContent = "WS2: Connected";
+          ws2Status.className = "status connected";
+          debugLog("WS2 connected");
+        };
+
+        ws2.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          debugLog(`WS2 received: ${JSON.stringify(data)}`);
+
+          if (data.type === "start_price") {
+            startPrice = parseFloat(data.price);
+            startPriceDiv.textContent = `$${startPrice.toLocaleString()}`;
+            const currentLength = priceChart.data.labels.length;
+            const refLine = Array(currentLength).fill(startPrice);
+            priceChart.data.datasets[1].data = refLine;
+            priceChart.update('none');
+          }
+
+          if (data.type === "end_price") {
+            endPriceDiv.textContent = `$${parseFloat(data.price).toLocaleString()}`;
+          }
+
+          if (data.type === "result") {
+            resultDiv.textContent = `🟡 ${data.result.toUpperCase()}`;
+            setTimeout(resetUI, 5000);
+          }
+        };
+
+        ws2.onclose = () => {
+          ws2Status.textContent = "WS2: Disconnected";
+          ws2Status.className = "status disconnected";
+          debugLog("WS2 disconnected. Reconnecting...");
+          setTimeout(connectWebSocket2, 3000);
+        };
+
+        ws2.onerror = (error) => {
+          ws2Status.textContent = "WS2: Error";
+          ws2Status.className = "status error";
+          debugLog(`WS2 error: ${error}`);
+        };
+      } catch (err) {
+        debugLog(`WS2 connection error: ${err.message}`);
+      }
+    }
+
+    function resetUI() {
+      debugLog("Resetting UI...");
+      startPrice = null;
+      startPriceDiv.textContent = "-";
+      endPriceDiv.textContent = "-";
+      resultDiv.textContent = "-";
+      priceChart.data.datasets[1].data = [];
+      priceChart.update('none');
+      cycleStart = Date.now() - (Date.now() % 60000);
+    }
+
+    function updateTimer() {
+      const now = Date.now();
+      const diff = now - cycleStart;
+
+      if (diff < 40000) {
+        timerDiv.textContent = `Betting Phase: ${40 - Math.floor(diff / 1000)}s left`;
+      } else if (diff < 55000) {
+        timerDiv.textContent = `Live Phase: ${55 - Math.floor(diff / 1000)}s left`;
+      } else if (diff < 60000) {
+        timerDiv.textContent = `Distribution Phase: ${60 - Math.floor(diff / 1000)}s left`;
+      } else {
+        resetUI();
+      }
+
+      if (Date.now() - lastPriceUpdate > 10000) {
+        livePriceDiv.textContent = "No data received";
+      }
+    }
+
+    connectWebSocket1();
+    connectWebSocket2();
+    setInterval(updateTimer, 1000);
+    debugLog("App initialized");
+  </script>
+</body>
+</html>
