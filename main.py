@@ -29,20 +29,109 @@ current_game = {
 }
 
 
-# Connect to Binance stream and update price buffer
+# Receive data from WebSocket every 75ms with proper Binance WebSocket handling
 async def binance_listener():
     url = "wss://fstream.binance.com/ws/btcusdt@trade"
-    async with websockets.connect(url) as ws:
-        async for message in ws:
-            data = json.loads(message)
-            price = float(data["p"])
-            timestamp = int(data["T"])
-            price_buffer.append((timestamp, price))
-            if len(price_buffer) > 5000:
-                price_buffer.pop(0)
-            await broadcast(
-                clients_ws1, json.dumps({"price": price, "timestamp": timestamp})
-            )
+    latest_price = None
+    latest_timestamp = None
+    reconnect_delay = 1  # Start with 1 second, exponential backoff
+    max_reconnect_delay = 60  # Max 60 seconds between reconnects
+
+    async def ws_receiver():
+        nonlocal latest_price, latest_timestamp, reconnect_delay
+
+        while True:
+            try:
+                print(f"Connecting to Binance WebSocket: {url}")
+
+                # Connect with ping/pong handling
+                async with websockets.connect(
+                    url,
+                    ping_interval=180,  # Send ping every 3 minutes (180 seconds)
+                    ping_timeout=600,  # Wait up to 10 minutes for pong response
+                    close_timeout=10,
+                ) as ws:
+                    print("Connected to Binance WebSocket")
+                    reconnect_delay = 1  # Reset delay on successful connection
+
+                    # Track connection time for 24-hour limit
+                    connection_start = time.time()
+
+                    async for message in ws:
+                        try:
+                            # Check if we've been connected for nearly 24 hours
+                            if (
+                                time.time() - connection_start > 23.5 * 3600
+                            ):  # 23.5 hours
+                                print(
+                                    "Approaching 24-hour connection limit, reconnecting..."
+                                )
+                                break
+
+                            data = json.loads(message)
+                            latest_price = float(data["p"])
+                            latest_timestamp = int(data["T"])
+
+                        except json.JSONDecodeError as e:
+                            print(f"Error parsing JSON: {e}")
+                            continue
+                        except KeyError as e:
+                            print(f"Missing expected field in WebSocket message: {e}")
+                            continue
+                        except Exception as e:
+                            print(f"Error processing WebSocket message: {e}")
+                            continue
+
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"WebSocket connection closed: {e}")
+            except websockets.exceptions.InvalidStatusCode as e:
+                print(f"WebSocket connection failed with status code: {e}")
+            except Exception as e:
+                print(f"WebSocket connection error: {e}")
+
+            # Exponential backoff for reconnection
+            print(f"Reconnecting in {reconnect_delay} seconds...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+    async def price_processor():
+        message_count = 0
+        last_reset_time = time.time()
+
+        while True:
+            start_time = time.time()
+
+            # Rate limiting: max 10 messages per second to clients
+            current_time = time.time()
+            if current_time - last_reset_time >= 1.0:
+                message_count = 0
+                last_reset_time = current_time
+
+            if (
+                message_count < 10
+                and latest_price is not None
+                and latest_timestamp is not None
+            ):
+                # Use the actual timestamp from Binance
+                timestamp = latest_timestamp
+
+                price_buffer.append((timestamp, latest_price))
+                if len(price_buffer) > 5000:
+                    price_buffer.pop(0)
+
+                await broadcast(
+                    clients_ws1,
+                    json.dumps({"price": latest_price, "timestamp": timestamp}),
+                )
+                message_count += 1
+
+            # Calculate how long to wait to maintain 75ms intervals
+            elapsed = (time.time() - start_time) * 1000  # Convert to ms
+            sleep_time = max(0, (75 - elapsed) / 1000)  # Convert back to seconds
+            await asyncio.sleep(sleep_time)
+
+    # Run both tasks concurrently
+    await asyncio.gather(ws_receiver(), price_processor())
 
 
 # Broadcast helper
@@ -197,5 +286,6 @@ async def game_loop():
 # Startup tasks
 @app.on_event("startup")
 async def startup():
+    # WebSocket connection with 75ms data processing
     asyncio.create_task(binance_listener())
     asyncio.create_task(game_loop())
