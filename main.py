@@ -18,7 +18,9 @@ app.add_middleware(
 
 clients_ws1: List[WebSocket] = []
 clients_ws2: List[WebSocket] = []
+# Circular buffer to store exactly 100 price points
 price_buffer: List[Tuple[int, float]] = []
+MAX_BUFFER_SIZE = 100
 
 # Store the current game state
 current_game = {
@@ -115,8 +117,10 @@ async def binance_listener():
                 # Use the actual timestamp from Binance
                 timestamp = latest_timestamp
 
+                # Add new price to buffer
                 price_buffer.append((timestamp, latest_price))
-                if len(price_buffer) > 5000:
+                # Keep only the last 100 data points
+                if len(price_buffer) > MAX_BUFFER_SIZE:
                     price_buffer.pop(0)
 
                 await broadcast(
@@ -157,13 +161,8 @@ async def websocket_stream_binance(websocket: WebSocket):
     await websocket.accept()
     clients_ws1.append(websocket)
 
-    # send last 60s of data on connect
-    now = int(time.time() * 1000)
-    history = [
-        {"price": price, "timestamp": ts}
-        for ts, price in price_buffer
-        if ts >= now - 60_000
-    ]
+    # send all available data (up to 100 points) on connect
+    history = [{"price": price, "timestamp": ts} for ts, price in price_buffer]
     await websocket.send_text(json.dumps({"type": "history", "data": history}))
 
     try:
