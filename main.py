@@ -18,9 +18,12 @@ app.add_middleware(
 
 clients_ws1: List[WebSocket] = []
 clients_ws2: List[WebSocket] = []
-# Circular buffer to store exactly 100 price points
+# Circular buffer to store exactly 700 price points
 price_buffer: List[Tuple[int, float]] = []
-MAX_BUFFER_SIZE = 100
+MAX_BUFFER_SIZE = 700
+
+# Store the latest price received from Binance
+latest_price_data = {"price": None, "timestamp": None}
 
 # Store the current game state
 current_game = {
@@ -31,120 +34,111 @@ current_game = {
 }
 
 
-# Receive data from WebSocket every 75ms with proper Binance WebSocket handling
+# Receive data from WebSocket and store the latest price
 async def binance_listener():
     url = "wss://fstream.binance.com/ws/btcusdt@trade"
-    latest_price = None
-    latest_timestamp = None
     reconnect_delay = 1  # Start with 1 second, exponential backoff
     max_reconnect_delay = 60  # Max 60 seconds between reconnects
 
-    async def ws_receiver():
-        nonlocal latest_price, latest_timestamp, reconnect_delay
+    while True:
+        try:
+            print(f"Connecting to Binance WebSocket: {url}")
 
-        while True:
-            try:
-                print(f"Connecting to Binance WebSocket: {url}")
+            # Connect with ping/pong handling
+            async with websockets.connect(
+                url,
+                ping_interval=180,  # Send ping every 3 minutes (180 seconds)
+                ping_timeout=600,  # Wait up to 10 minutes for pong response
+                close_timeout=10,
+            ) as ws:
+                print("Connected to Binance WebSocket")
+                reconnect_delay = 1  # Reset delay on successful connection
 
-                # Connect with ping/pong handling
-                async with websockets.connect(
-                    url,
-                    ping_interval=180,  # Send ping every 3 minutes (180 seconds)
-                    ping_timeout=600,  # Wait up to 10 minutes for pong response
-                    close_timeout=10,
-                ) as ws:
-                    print("Connected to Binance WebSocket")
-                    reconnect_delay = 1  # Reset delay on successful connection
+                # Track connection time for 24-hour limit
+                connection_start = time.time()
 
-                    # Track connection time for 24-hour limit
-                    connection_start = time.time()
+                async for message in ws:
+                    try:
+                        # Check if we've been connected for nearly 24 hours
+                        if time.time() - connection_start > 23.5 * 3600:  # 23.5 hours
+                            print(
+                                "Approaching 24-hour connection limit, reconnecting..."
+                            )
+                            break
 
-                    async for message in ws:
-                        try:
-                            # Check if we've been connected for nearly 24 hours
-                            if (
-                                time.time() - connection_start > 23.5 * 3600
-                            ):  # 23.5 hours
-                                print(
-                                    "Approaching 24-hour connection limit, reconnecting..."
-                                )
-                                break
+                        data = json.loads(message)
+                        # Update the latest price data immediately
+                        latest_price_data["price"] = float(data["p"])
+                        latest_price_data["timestamp"] = int(data["T"])
 
-                            data = json.loads(message)
-                            latest_price = float(data["p"])
-                            latest_timestamp = int(data["T"])
+                    except json.JSONDecodeError as e:
+                        print(f"Error parsing JSON: {e}")
+                        continue
+                    except KeyError as e:
+                        print(f"Missing expected field in WebSocket message: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"Error processing WebSocket message: {e}")
+                        continue
 
-                        except json.JSONDecodeError as e:
-                            print(f"Error parsing JSON: {e}")
-                            continue
-                        except KeyError as e:
-                            print(f"Missing expected field in WebSocket message: {e}")
-                            continue
-                        except Exception as e:
-                            print(f"Error processing WebSocket message: {e}")
-                            continue
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"WebSocket connection closed: {e}")
+        except websockets.exceptions.InvalidStatusCode as e:
+            print(f"WebSocket connection failed with status code: {e}")
+        except Exception as e:
+            print(f"WebSocket connection error: {e}")
 
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"WebSocket connection closed: {e}")
-            except websockets.exceptions.InvalidStatusCode as e:
-                print(f"WebSocket connection failed with status code: {e}")
-            except Exception as e:
-                print(f"WebSocket connection error: {e}")
+        # Exponential backoff for reconnection
+        print(f"Reconnecting in {reconnect_delay} seconds...")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
-            # Exponential backoff for reconnection
-            print(f"Reconnecting in {reconnect_delay} seconds...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
-    async def price_processor():
-        message_count = 0
-        last_reset_time = time.time()
+# Send price data every 75ms using the latest available price
+async def price_broadcaster():
+    while True:
+        start_time = time.time()
 
-        while True:
-            start_time = time.time()
+        # Only send if we have valid price data
+        if (
+            latest_price_data["price"] is not None
+            and latest_price_data["timestamp"] is not None
+        ):
+            current_price = latest_price_data["price"]
+            # Use the actual current time for the 75ms interval timestamp
+            current_timestamp = int(time.time() * 1000)
 
-            # Rate limiting: max 10 messages per second to clients
-            current_time = time.time()
-            if current_time - last_reset_time >= 1.0:
-                message_count = 0
-                last_reset_time = current_time
+            # Add the 75ms interval data to buffer
+            price_buffer.append((current_timestamp, current_price))
+            # Keep only the last MAX_BUFFER_SIZE data points
+            if len(price_buffer) > MAX_BUFFER_SIZE:
+                price_buffer.pop(0)
 
-            if (
-                message_count < 10
-                and latest_price is not None
-                and latest_timestamp is not None
-            ):
-                # Use the actual timestamp from Binance
-                timestamp = latest_timestamp
+            # Broadcast to all clients with the 75ms interval timestamp
+            await broadcast(
+                clients_ws1,
+                json.dumps({"price": current_price, "timestamp": current_timestamp}),
+            )
 
-                # Add new price to buffer
-                price_buffer.append((timestamp, latest_price))
-                # Keep only the last 100 data points
-                if len(price_buffer) > MAX_BUFFER_SIZE:
-                    price_buffer.pop(0)
-
-                await broadcast(
-                    clients_ws1,
-                    json.dumps({"price": latest_price, "timestamp": timestamp}),
-                )
-                message_count += 1
-
-            # Calculate how long to wait to maintain 75ms intervals
-            elapsed = (time.time() - start_time) * 1000  # Convert to ms
-            sleep_time = max(0, (75 - elapsed) / 1000)  # Convert back to seconds
-            await asyncio.sleep(sleep_time)
-
-    # Run both tasks concurrently
-    await asyncio.gather(ws_receiver(), price_processor())
+        # Calculate precise sleep time to maintain 75ms intervals
+        elapsed = (time.time() - start_time) * 1000  # Convert to ms
+        sleep_time = max(0, (75 - elapsed) / 1000)  # Convert back to seconds
+        await asyncio.sleep(sleep_time)
 
 
 # Broadcast helper
 async def broadcast(clients: List[WebSocket], message: str):
+    disconnected_clients = []
     for client in clients:
         try:
             await client.send_text(message)
         except:
-            pass
+            disconnected_clients.append(client)
+
+    # Remove disconnected clients
+    for client in disconnected_clients:
+        if client in clients:
+            clients.remove(client)
 
 
 # Get price at the closest timestamp
@@ -161,7 +155,7 @@ async def websocket_stream_binance(websocket: WebSocket):
     await websocket.accept()
     clients_ws1.append(websocket)
 
-    # send all available data (up to 100 points) on connect
+    # send all available data (up to MAX_BUFFER_SIZE points) on connect
     history = [{"price": price, "timestamp": ts} for ts, price in price_buffer]
     await websocket.send_text(json.dumps({"type": "history", "data": history}))
 
@@ -169,7 +163,8 @@ async def websocket_stream_binance(websocket: WebSocket):
         while True:
             await asyncio.sleep(10)
     except WebSocketDisconnect:
-        clients_ws1.remove(websocket)
+        if websocket in clients_ws1:
+            clients_ws1.remove(websocket)
 
 
 # WS endpoint for game state updates
@@ -203,7 +198,8 @@ async def websocket_game_logic(websocket: WebSocket):
         while True:
             await asyncio.sleep(10)
     except WebSocketDisconnect:
-        clients_ws2.remove(websocket)
+        if websocket in clients_ws2:
+            clients_ws2.remove(websocket)
 
 
 # Game cycle manager: start_price @ +40s, end_price @ +55s, result immediately @ +55s
@@ -285,6 +281,9 @@ async def game_loop():
 # Startup tasks
 @app.on_event("startup")
 async def startup():
-    # WebSocket connection with 75ms data processing
+    # Start the Binance WebSocket listener
     asyncio.create_task(binance_listener())
+    # Start the price broadcaster that sends data every 75ms
+    asyncio.create_task(price_broadcaster())
+    # Start the game loop
     asyncio.create_task(game_loop())
