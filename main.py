@@ -20,7 +20,7 @@ clients_ws1: List[WebSocket] = []
 clients_ws2: List[WebSocket] = []
 # Circular buffer to store exactly 700 price points
 price_buffer: List[Tuple[int, float]] = []
-MAX_BUFFER_SIZE = 700
+MAX_BUFFER_SIZE = 1200
 
 # Store the latest price received from Binance
 latest_price_data = {"price": None, "timestamp": None}
